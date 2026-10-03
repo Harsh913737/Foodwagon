@@ -1,0 +1,16 @@
+name: Keep Render Alive 24/7
+
+on:
+  schedule:
+    # Run every 10 minutes
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  keep-alive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping WhatsApp Gateway
+        run: |
+          echo "Pinging Food Wagon WhatsApp Gateway on Render..."
+          curl -sS -m 20 https://foodwagon-whatsapp-gateway.onrender.com/health || echo "Ping failed or timed out"
