@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: foodwagon-whatsapp-gateway
+    runtime: node
+    plan: free
+    region: singapore
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: NODE_VERSION
+        value: 20.18.0
+      - key: HOSTINGER_API
+        value: https://admin.foodwagon.in/api/wa_session
+      - key: WA_SECRET
+        value: FoodWagon_WA_Secret_2026
