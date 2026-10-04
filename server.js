@@ -2,7 +2,8 @@ import express from 'express';
 import makeWASocket, {
   DisconnectReason,
   useMultiFileAuthState,
-  fetchLatestBaileysVersion
+  fetchLatestBaileysVersion,
+  Browsers
 } from '@whiskeysockets/baileys';
 import pino from 'pino';
 import QRCode from 'qrcode';
@@ -24,6 +25,7 @@ let isConnected = false;
 let currentQr = null;
 let currentQrImage = null;
 let backupTimeout = null;
+let connectionWatchdog = null;
 
 // Restore saved session from Hostinger cloud on startup
 async function restoreSessionFromHostinger() {
@@ -36,12 +38,12 @@ async function restoreSessionFromHostinger() {
     console.log('[Cloud Session] Checking Hostinger for saved WhatsApp session...');
     const resp = await fetch(`${HOSTINGER_API}/restore?secret=${WA_SECRET}`);
     if (!resp.ok) {
-      console.log('[Cloud Session] No previous session found on Hostinger. New QR required.');
+      console.log('[Cloud Session] No previous session found on Hostinger.');
       return false;
     }
 
     const files = await resp.json();
-    if (!files || typeof files !== 'object' || Object.keys(files).length === 0) {
+    if (!files || typeof files !== 'object' || Object.keys(files).length === 0 || files.status === 0) {
       console.log('[Cloud Session] Empty session received.');
       return false;
     }
@@ -96,7 +98,19 @@ function scheduleBackup() {
   }, 2500);
 }
 
+// Clean session locally and remotely
+async function wipeSession() {
+  try {
+    fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+  } catch (e) {}
+  try {
+    await fetch(`${HOSTINGER_API}/clear?secret=${WA_SECRET}`, { method: 'POST' });
+  } catch (e) {}
+}
+
 async function startWhatsApp() {
+  if (connectionWatchdog) clearTimeout(connectionWatchdog);
+
   await restoreSessionFromHostinger();
 
   if (!fs.existsSync(AUTH_DIR)) {
@@ -106,12 +120,15 @@ async function startWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
 
+  // Standard Ubuntu Chrome browser identifier (prevents WhatsApp Web random disconnects)
   sock = makeWASocket({
     version,
     logger: pino({ level: 'silent' }),
     printQRInTerminal: false,
     auth: state,
-    browser: ['Food Wagon Cloud', 'Chrome', '1.0.0']
+    browser: Browsers.ubuntu('Chrome'),
+    connectTimeoutMs: 30000,
+    keepAliveIntervalMs: 25000
   });
 
   sock.ev.on('creds.update', () => {
@@ -119,42 +136,58 @@ async function startWhatsApp() {
     scheduleBackup();
   });
 
+  // Watchdog: If attempting to connect with an old saved session, but it hangs for 25s without connecting or giving QR
+  const hasSavedCreds = fs.existsSync(path.join(AUTH_DIR, 'creds.json'));
+  if (hasSavedCreds && !isConnected) {
+    connectionWatchdog = setTimeout(async () => {
+      if (!isConnected && !currentQrImage) {
+        console.warn('[Watchdog] Stale session detected (connection hung). Wiping and generating new QR...');
+        await wipeSession();
+        if (sock) {
+          try { sock.end(); } catch (e) {}
+          sock = null;
+        }
+        setTimeout(startWhatsApp, 2000);
+      }
+    }, 25000);
+  }
+
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
+      if (connectionWatchdog) clearTimeout(connectionWatchdog);
       currentQr = qr;
       try {
         currentQrImage = await QRCode.toDataURL(qr, { margin: 2, scale: 8 });
       } catch (err) {
         console.error('Error creating QR image:', err);
       }
-      console.log('\n======================================================');
-      console.log('NEW QR CODE GENERATED - SCAN VIA BROWSER');
-      console.log('======================================================\n');
+      console.log('[WhatsApp] New QR code generated successfully.');
     }
 
     if (connection === 'close') {
+      if (connectionWatchdog) clearTimeout(connectionWatchdog);
       isConnected = false;
       const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut && statusCode !== 401;
       console.log(`[WhatsApp] Connection closed (code: ${statusCode}). Reconnecting: ${shouldReconnect}`);
+
       if (shouldReconnect) {
         setTimeout(startWhatsApp, 3000);
       } else {
-        console.log('[WhatsApp] Logged out. Clearing local session...');
-        try {
-          fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-        } catch (e) {}
+        console.log('[WhatsApp] Session logged out / invalid. Wiping local and cloud session...');
+        await wipeSession();
+        currentQr = null;
+        currentQrImage = null;
         setTimeout(startWhatsApp, 2000);
       }
     } else if (connection === 'open') {
+      if (connectionWatchdog) clearTimeout(connectionWatchdog);
       isConnected = true;
       currentQr = null;
       currentQrImage = null;
-      console.log('\n======================================================');
-      console.log('>>> WHATSAPP GATEWAY ONLINE & READY (24/7) <<<');
-      console.log('======================================================\n');
+      console.log('[WhatsApp] >>> WHATSAPP GATEWAY ONLINE & CONNECTED (24/7) <<<');
       scheduleBackup();
     }
   });
@@ -226,6 +259,35 @@ app.get('/health', (req, res) => {
   res.status(200).send('OK');
 });
 
+// Reset endpoint to cleanly wipe and generate a new QR code immediately
+app.get('/reset', async (req, res) => {
+  console.log('[Reset] Manual reset requested by user.');
+  if (connectionWatchdog) clearTimeout(connectionWatchdog);
+  isConnected = false;
+  currentQr = null;
+  currentQrImage = null;
+  if (sock) {
+    try { sock.end(); } catch (e) {}
+    sock = null;
+  }
+  await wipeSession();
+  setTimeout(startWhatsApp, 1500);
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <meta http-equiv="refresh" content="3;url=/" />
+        <title>Resetting WhatsApp Session</title>
+        <style>body{font-family:sans-serif; text-align:center; padding:50px; background:#f8fafc;}</style>
+      </head>
+      <body>
+        <h2 style="color:#f97316;">Session Cleared Successfully!</h2>
+        <p>Generating a fresh WhatsApp QR code. Redirecting in 3 seconds...</p>
+      </body>
+    </html>
+  `);
+});
+
 app.get('/', (req, res) => {
   let content = '';
   if (isConnected) {
@@ -238,6 +300,9 @@ app.get('/', (req, res) => {
           Running 24/7 in the cloud on Render.<br>
           Your PC is NOT needed. All OTPs from App & Website are sent automatically.
         </p>
+        <div style="margin-top: 20px;">
+          <a href="/reset" onclick="return confirm('Do you want to disconnect and link a new WhatsApp account?');" style="color: #666; font-size: 12px; text-decoration: underline;">Disconnect / Link Another Number</a>
+        </div>
       </div>
     `;
   } else if (currentQrImage) {
@@ -252,6 +317,9 @@ app.get('/', (req, res) => {
           <img src="${currentQrImage}" alt="Scan QR Code" style="width: 280px; height: 280px; border-radius: 8px; border: 1px solid #ddd;" />
         </div>
         <p style="color: #888; font-size: 12px;">This page auto-refreshes every 4 seconds...</p>
+        <div style="margin-top: 15px;">
+          <a href="/reset" style="display:inline-block; padding: 8px 16px; background:#f1f5f9; color:#475569; text-decoration:none; border-radius:6px; font-size:13px; font-weight:600;">🔄 Reset &amp; Regenerate QR</a>
+        </div>
       </div>
       <script>
         setTimeout(() => { location.reload(); }, 4000);
@@ -261,10 +329,13 @@ app.get('/', (req, res) => {
     content = `
       <div style="background: #e3f2fd; border: 2px solid #2196f3; padding: 25px; border-radius: 12px; display: inline-block; max-width: 500px;">
         <h2 style="color: #0d47a1; margin-top:0;">Initializing Cloud WhatsApp Gateway...</h2>
-        <p style="color: #1565c0;">Generating WhatsApp QR code, please wait 5-10 seconds...</p>
+        <p style="color: #1565c0;">Generating WhatsApp QR code, please wait a moment...</p>
+        <div style="margin-top: 20px;">
+          <a href="/reset" style="display:inline-block; padding: 8px 16px; background:#f97316; color:#fff; text-decoration:none; border-radius:6px; font-size:13px; font-weight:600;">Click Here to Force Generate New QR</a>
+        </div>
       </div>
       <script>
-        setTimeout(() => { location.reload(); }, 3000);
+        setTimeout(() => { location.reload(); }, 4000);
       </script>
     `;
   }
